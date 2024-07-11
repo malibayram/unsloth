@@ -83,7 +83,8 @@ def _fast_prepare_inputs_for_generation(self, input_ids, **kwargs,):
     if "past_key_values" in kwargs:
         input_ids = input_ids[:,[-1]]
         kwargs["attention_mask"] = kwargs["attention_mask"][:,[-1]]
-    kwargs["position_ids"] = kwargs["cache_position"]
+    if "cache_position" in kwargs:
+        kwargs["position_ids"] = kwargs["cache_position"]
     return { "input_ids" : input_ids, **kwargs, }
 pass
 
@@ -663,8 +664,11 @@ def LlamaModel_fast_forward(
 
     # Gemma2 has alternating SWA and global attn
     if IS_GEMMA2 and not hasattr(self, "SWA_mask"):
-        from transformers.modeling_attn_mask_utils import AttentionMaskConverter
         n = self.config.max_position_embeddings
+        # masked_fill is making stuff slower!
+        # self. GA_mask = create_boolean_mask(n = n, sliding_window = 0)
+        # self.SWA_mask = create_boolean_mask(n = n, sliding_window = self.config.sliding_window)
+        from transformers.modeling_attn_mask_utils import AttentionMaskConverter
         self.SWA_mask = AttentionMaskConverter(
             is_causal = True,
             sliding_window = self.config.sliding_window,
@@ -893,9 +897,15 @@ def CausalLM_fast_forward(fast_forward_inference):
                 logit_softcapping = logit_softcapping,
             )
         elif logit_softcapping != 0:
-            logits *= (1.0 / logit_softcapping)
-            torch.tanh(logits, out = logits)
-            logits *= logit_softcapping
+            if logits.requires_grad:
+                logits = (1.0 / logit_softcapping) * logits
+                logits = torch.tanh(logits)
+                logits = logit_softcapping * logits
+            else:
+                logits *= (1.0 / logit_softcapping)
+                torch.tanh(logits, out = logits)
+                logits *= logit_softcapping
+            pass
         pass
 
         if not return_dict:
@@ -1033,9 +1043,9 @@ def _wrap_fast_inference(generate, device_type, dtype, model):
         kwargs["cache_implementation"] = "dynamic"
 
         # Set pad token
-        old_pad_token_id = getattr(model.config, "pad_token_id", None)
-        old_eos_token_id = getattr(model.config, "eos_token_id", None)
-        model.config.pad_token_id = old_eos_token_id
+        # old_pad_token_id = getattr(model.config, "pad_token_id", None)
+        # old_eos_token_id = getattr(model.config, "eos_token_id", None)
+        # model.config.pad_token_id = old_eos_token_id
 
         # Autocasted
         with torch.autocast(device_type = device_type, dtype = dtype):
@@ -1043,7 +1053,7 @@ def _wrap_fast_inference(generate, device_type, dtype, model):
         pass
 
         # Revert
-        model.config.pad_token_id = old_pad_token_id
+        # model.config.pad_token_id = old_pad_token_id
 
         # Unset a flag for generation!
         internal_model = model
@@ -1099,6 +1109,13 @@ class FastLlamaModel:
         trust_remote_code = False,
         **kwargs,
     ):
+        if trust_remote_code:
+            print(
+                "Unsloth: WARNING `trust_remote_code` is True.\n"\
+                "Are you certain you want to do remote code execution?"
+            )
+        pass
+
         if token is None and "HF_TOKEN" in os.environ:
             token = os.environ["HF_TOKEN"]
 
@@ -1118,7 +1135,7 @@ class FastLlamaModel:
            f' "-____-"     Free Apache license: http://github.com/unslothai/unsloth'
         print(statistics)
         model_patcher.pre_patch()
-        # get_statistics()
+        get_statistics() # For debugging - we use a download counter to see if environments are not breaking 
 
         if dtype is None:
             dtype = torch.float16 if not SUPPORTS_BFLOAT16 else torch.bfloat16
@@ -1139,6 +1156,7 @@ class FastLlamaModel:
             with open(inspect.getfile(model_function), "r") as file:
                 has_rope_scaling = "self.config.rope_scaling" in file.read()
         except: pass
+        has_rope_scaling = True
 
         # If max_seq_length is not specified, use maximum fron config
         if max_seq_length is None:
@@ -1169,6 +1187,8 @@ class FastLlamaModel:
             # Add to kwargs
             kwargs["rope_scaling"] = rope_scaling
         pass
+        # We currently only support NVIDIA GPUs - AMD / Intel is a work in progress!
+        pre_check = check_nvidia()
 
         bnb_config = None
         if load_in_4bit:
@@ -1183,6 +1203,7 @@ class FastLlamaModel:
         # https://huggingface.co/togethercomputer/LLaMA-2-7B-32K/discussions/12
         # RoPE Scaling's max_position_embeddings must be updated
         max_position_embeddings = max(max_seq_length, model_max_seq_length)
+        kwargs.pop("attn_implementation", None); # No need since we auto call it
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map              = device_map,
@@ -1191,8 +1212,11 @@ class FastLlamaModel:
             token                   = token,
             max_position_embeddings = max_position_embeddings,
             trust_remote_code       = trust_remote_code,
+            attn_implementation     = "eager",
             **kwargs,
         )
+        # We currently only support NVIDIA GPUs - AMD / Intel is a work in progress!
+        post_check = check_nvidia()
 
         # Counteract saved tokenizers
         tokenizer_name = model_name if tokenizer_name is None else tokenizer_name
@@ -1222,13 +1246,11 @@ class FastLlamaModel:
             else:
                 inner_training_loop = Trainer._original_training_loop
         except:
-            raise RuntimeError(
-                'Unsloth currently does not work on multi GPU setups - sadly we are a 2 brother team so '\
-                'enabling it will require much more work, so we have to prioritize. Please understand!\n'\
-                'We do have a separate beta version, which you can contact us about!\n'\
-                'Thank you for your understanding and we appreciate it immensely!'
-            )
+            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
         pass
+
+        if ((post_check - pre_check) >= 1).sum() > 1:
+            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
 
         import transformers.trainer
         items_in_trainer = dir(transformers.trainer)
@@ -1253,16 +1275,17 @@ class FastLlamaModel:
         f"\\        /    Total batch size = {total_train_batch_size:,} | Total steps = {max_steps:,}\\n"\\
         f' "-____-"     Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}'
         logger.warning(debug_info)
-        import subprocess, re, gc
-        output = subprocess.check_output(
-            'nvidia-smi --query-gpu=memory.used --format=csv', shell = True)
-        output = re.findall(rb'([\\d]{1,})[\\s]{1,}M', output)
-        output = sum(int(x.decode('utf-8'))/1024 > 4 for x in output)
-        if output > 1: print(
-            '********************\\nUnsloth currently does not work on multi GPU setups - sadly we are a 2 brother team so '\\
-            'enabling it will require much more work, so we have to prioritize. Please understand!\\n'\\
-            '********************\\nWe do have a separate beta version, which you can contact us about!\\n'\\
-            '********************\\nThank you for your understanding and we appreciate it immensely!')
+        import subprocess, re, gc, numpy as np
+        a = np.array([0,])
+        try:
+            a = subprocess.check_output('nvidia-smi --query-gpu=memory.used --format=csv', shell = True)
+            a = re.findall(rb'([\\d]{1,})[\\s]{1,}M', a)
+            a = np.array([int(x.decode('utf-8'))/1024 for x in a])
+        except:
+            if not torch.cuda.is_available():
+                raise RuntimeError('Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!')
+        if ((a - PRE_CHECK) >= 1).sum() > 1:
+            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
         for _ in range(3):
             gc.collect()
             torch.cuda.empty_cache()"""
@@ -1274,12 +1297,7 @@ class FastLlamaModel:
         debug_info = """n_total_devices = total_train_batch_size // \\
             args.gradient_accumulation_steps // self._train_batch_size
         if n_total_devices > 1:
-            logger.warning_once(
-                '* Unsloth currently does not work on multi GPU setups - sadly we are a 2 brother team so ' \\
-                '* enabling it will require much more work, so we have to prioritize. Please understand!\\n' \\
-                '* We do have a separate beta version, which you can contact us about!\\n'\\
-                '* Thank you for your understanding and we appreciate it immensely!'
-            )
+            logger.warning_once('Unsloth currently does not support multi GPU setups - but we are working on it!')
         debug_info ="""
         debug_info = debug_info.split('\n')
         debug_info = "\n".join([debug_info[0]] + [spaces + x[8:] for x in debug_info[1:]])
@@ -1304,12 +1322,7 @@ class FastLlamaModel:
         total_batches = bsz * ga * args.world_size
         n_total_devices = total_batches // ga // bsz
         if n_total_devices > 1:
-            logger.warning_once(
-                '* Unsloth currently does not work on multi GPU setups - sadly we are a 2 brother team so ' \\
-                '* enabling it will require much more work, so we have to prioritize. Please understand!\\n' \\
-                '* We do have a separate beta version, which you can contact us about!\\n'\\
-                '* Thank you for your understanding and we appreciate it immensely!'
-            )
+            logger.warning_once('Unsloth currently does not support multi GPU setups - but we are working on it!')
             divisor = n_total_devices / 1
             bsz = self._train_batch_size = max(int(bsz / divisor), 1)
             if total_batches // ga // bsz > 1:
@@ -1333,12 +1346,7 @@ class FastLlamaModel:
             "False",
         )
         if "n_total_devices >" not in inner_training_loop:
-            raise RuntimeError(
-                'Unsloth currently does not work on multi GPU setups - sadly we are a 2 brother team so '\
-                'enabling it will require much more work, so we have to prioritize. Please understand!\n'\
-                'We do have a separate beta version, which you can contact us about!\n'\
-                'Thank you for your understanding and we appreciate it immensely!'
-            )
+            raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')
         pass
         inner_training_loop = inner_training_loop.replace(
             "is_sagemaker_mp_enabled()",
