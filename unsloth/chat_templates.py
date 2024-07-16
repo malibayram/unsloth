@@ -21,6 +21,7 @@ __all__ = [
     "to_sharegpt",
     "standardize_sharegpt",
     "apply_chat_template",
+    "train_on_responses_only",
 
     "test_construct_chat_template",
 ]
@@ -1063,7 +1064,6 @@ default_system_message = \
     "Below are some instructions that describe some tasks. Write responses that appropriately complete each request.",
 
 extra_eos_tokens = None,
-  
 ):
     """
     Creates a Ollama modelfile and a HF Jinja template from a custom
@@ -1072,6 +1072,9 @@ extra_eos_tokens = None,
 
     You must use {INPUT}, {OUTPUT} twice, and {SYSTEM} is optional.
     """
+    # Strip only the left
+    chat_template = chat_template.lstrip()
+
     assert(tokenizer is not None)
 
     if extra_eos_tokens is None: extra_eos_tokens = []
@@ -1122,67 +1125,104 @@ extra_eos_tokens = None,
     for eos in extra_eos_tokens:
         count_eos += len(re.findall(r"{OUTPUT}" + re.escape(eos), chat_template))
     pass
+
+    # This forces you to provide 2 input and outputs
+    final_combined_check = False
+
+    try:
+        # O(N^2) search finding 2 repeatted pieces of text
+        j = len(chat_template)-1
+        at_least_one = False
+        while j > 0:
+            found = chat_template.rfind(chat_template[j:], 0, j)
+            if found == -1: break
+            j -= 1
+            at_least_one = True
+        pass
+        if j > 0: j += 1
+        else: raise RuntimeError(error_msg)
+
+        if not at_least_one: raise RuntimeError(error_msg)
+
+        # Must be equivalent to left
+        final_combined_check = True
+
+        # Repeatted text
+        instruction_response = chat_template[j:]
+        if instruction_response.count("{INPUT}") != 1 or instruction_response.count("{OUTPUT}") != 1:
+            raise RuntimeError(error_msg)
+        pass
+
+        # 1st System, Instruction, Output pair
+        left  = chat_template[:j]
+        # 2nd Instruction, Output pair
+        right = chat_template[j:]
+
+        final_combined_check = left if final_combined_check else chat_template
+
+        # Isolate input
+        extra_eos_tokens_regex = "|".join(f"(?:{re.escape(x)})" for x in extra_eos_tokens)
+        if len(extra_eos_tokens_regex) != 0:
+            find_end = f"(?:{extra_eos_tokens_regex})?"
+        else:
+            find_end = ""
+        find_end = r"\{INPUT\}[\s\n]{0,}" + find_end
+        input_end = list(re.finditer(find_end, right))
+        assert(len(input_end) == 1)
+        input_end = input_end[0]
+        input_end = input_end.span(0)[1]
+        input_part = right[:input_end]
+
+        # Isolate output
+        output_part = right[input_end:]
+
+        # Isolate system
+        where_system = left.find(input_part)
+        system_part = left[:where_system if where_system != -1 else len(left)]
+
+        # Check if the user provided a correct prompt
+        combined = system_part + input_part + output_part
+        if combined != final_combined_check:
+            combined_changed = combined            .replace('\n', '\\n')
+            left_changed     = final_combined_check.replace('\n', '\\n')
+            raise RuntimeError(
+                "Unsloth: The prompt template you provided isn't correct. You gave:\n"\
+                f"{combined_changed}\n\n"\
+                "But we require the following:\n"\
+                f"{left_changed}"
+            )
+        pass
+    except:
+        ending = chat_template[chat_template.find("{OUTPUT}") + len("{OUTPUT}"):]
+
+        ending = re.escape(ending)
+        find_text = "{INPUT}" + ending + "(.+?{OUTPUT}" + ending + ")"
+        response_part = re.findall(find_text, chat_template, flags = re.DOTALL | re.MULTILINE)
+        response_part = response_part[0]
+
+        for j in range(1, len(response_part)):
+            try_find = re.escape(response_part[:j])
+            try: found = next(re.finditer("(" + try_find + ").+?\{INPUT\}", chat_template, flags = re.DOTALL | re.MULTILINE))
+            except: break
+        pass
+        separator = found.group(1)
+
+        response_start = chat_template.find(response_part)
+        start_instruction = chat_template[:response_start].rfind(separator)
+        if start_instruction == -1: start_instruction = 0
+        instruction_part = chat_template[start_instruction:response_start]
+
+        combined = instruction_part + response_part
+        where = chat_template.find(combined)
+        system_part = chat_template[:where]
+
+        system_part, input_part, output_part = system_part, instruction_part, response_part
+    pass
+
     if count_eos == 0:
         logger.warning("Unsloth: We automatically added an EOS token to stop endless generations.")
         eos = extra_eos_tokens[0]
-        chat_template = re.sub(r"{OUTPUT}", r"{OUTPUT}" + eos, chat_template)
-    pass
-
-    # O(N^2) search finding 2 repeatted pieces of text
-    j = len(chat_template)-1
-    at_least_one = False
-    while j > 0:
-        found = chat_template.rfind(chat_template[j:], 0, j)
-        if found == -1: break
-        j -= 1
-        at_least_one = True
-    pass
-    if j > 0: j += 1
-    else: raise RuntimeError(error_msg)
-
-    if not at_least_one: raise RuntimeError(error_msg)
-
-    # Repeatted text
-    instruction_response = chat_template[j:]
-    if instruction_response.count("{INPUT}") != 1 or instruction_response.count("{OUTPUT}") != 1:
-        raise RuntimeError(error_msg)
-    pass
-
-    # 1st System, Instruction, Output pair
-    left  = chat_template[:j]
-    # 2nd Instruction, Output pair
-    right = chat_template[j:]
-
-    # Isolate input
-    extra_eos_tokens_regex = "|".join(f"(?:{re.escape(x)})" for x in extra_eos_tokens)
-    if len(extra_eos_tokens_regex) != 0:
-        find_end = f"(?:{extra_eos_tokens_regex})?"
-    else:
-        find_end = ""
-    find_end = r"\{INPUT\}[\s\n]{0,}" + find_end
-    input_end = list(re.finditer(find_end, right))
-    assert(len(input_end) == 1)
-    input_end = input_end[0]
-    input_end = input_end.span(0)[1]
-    input_part = right[:input_end]
-
-    # Isolate output
-    output_part = right[input_end:]
-
-    # Isolate system
-    system_part = left[:left.find(input_part)]
-
-    # Check if the user provided a correct prompt
-    combined = system_part + input_part + output_part
-    if combined != left:
-        combined_changed = combined.replace('\n', '\\n')
-        left_changed     = left    .replace('\n', '\\n')
-        raise RuntimeError(
-            "Unsloth: The prompt template you provided isn't correct. You gave:\n"\
-            f"{combined_changed}\n\n"\
-            "But we require the following:\n"\
-            f"{left_changed}"
-        )
+        output_part = output_part + eos
     pass
 
     # Ollama modelfile parts
@@ -1285,6 +1325,15 @@ extra_eos_tokens = None,
             jinja_template = "{{ bos_token }}" + jinja_template
     pass
 
+    # Fix missing loop_messages
+    if "{% set loop_messages = messages %}" not in jinja_template:
+        jinja_template = jinja_template.replace(
+            "{% for message in loop_messages %}",
+            "{% for message in messages %}",
+            1, # Only replace the first one
+        )
+    pass
+
     # Check if system part is the same!
     jinja_template = re.sub(
         r"\{\% if messages\[0\]\['role'\] \=\= 'system' \%\}\{\{ '(.+?)' \}\}"\
@@ -1300,8 +1349,11 @@ extra_eos_tokens = None,
         if not jinja_template.startswith("{{ bos_token }}"):
             jinja_template = "{{ bos_token }}" + jinja_template
     pass
-    
-    return modelfile, jinja_template
+
+    # Get instruction and output parts for train_on_inputs = False
+    input_part  = input_part [:input_part .find("{INPUT}")]
+    output_part = output_part[:output_part.find("{OUTPUT}")]
+    return modelfile, jinja_template, input_part, output_part
 pass
 
 
@@ -1327,7 +1379,7 @@ def test_construct_chat_template():
       
     extra_eos_tokens = None
 
-    modelfile, jinja_template = construct_chat_template(
+    modelfile, jinja_template, _, _ = construct_chat_template(
         tokenizer = tokenizer,
         chat_template = chat_template,
         extra_eos_tokens = extra_eos_tokens,
@@ -1380,7 +1432,7 @@ extra_eos_tokens = None,
 
     You must use {INPUT}, {OUTPUT} twice, and {SYSTEM} is optional.
     """
-    modelfile, jinja_template = construct_chat_template(
+    modelfile, jinja_template, input_part, output_part = construct_chat_template(
         tokenizer = tokenizer,
         chat_template = chat_template,
         default_system_message = default_system_message,
@@ -1391,9 +1443,87 @@ extra_eos_tokens = None,
         texts = [tokenizer.apply_chat_template(convo, tokenize = False, add_generation_prompt = False) for convo in convos]
         return { "text" : texts, }
     pass
+
     tokenizer.chat_template = jinja_template
     tokenizer._ollama_modelfile = modelfile
+    tokenizer._unsloth_input_part  = input_part
+    tokenizer._unsloth_output_part = output_part
+
     return dataset.map(formatting_prompts_func, batched = True,)
+pass
+
+
+def train_on_responses_only(
+    trainer,
+    instruction_part = None,
+    response_part    = None,
+):
+    """
+    Trains only on responses and not on the instruction by masking out
+    the labels with -100 for the instruction part.
+    """
+    tokenizer = trainer.tokenizer
+    
+    if  not hasattr(tokenizer, "_unsloth_input_part") or \
+        not hasattr(tokenizer, "_unsloth_output_part"):
+        
+        if instruction_part is None or response_part is None:
+            raise ValueError("Unsloth: instruction_part and response_part must be given!")
+        pass
+    elif (instruction_part is not None or response_part is not None) and \
+        (hasattr(tokenizer, "_unsloth_input_part") or hasattr(tokenizer, "_unsloth_output_part")):
+
+        raise ValueError("Unsloth: Your tokenizer already has instruction and response parts set - do not give custom ones!")
+    else:
+        instruction_part = tokenizer._unsloth_input_part
+        response_part    = tokenizer._unsloth_output_part
+    pass
+
+    instruction_ids = tokenizer(instruction_part,  add_special_tokens = False).input_ids
+    response_ids    = tokenizer(response_part, add_special_tokens = False).input_ids
+
+    instruction_length = len(instruction_ids)
+    response_length    = len(response_ids)
+    max_length = max(instruction_length, response_length)
+
+    def _train_on_responses_only(examples):
+        input_ids_ = examples["input_ids"]
+        all_labels = []
+
+        for input_ids in input_ids_:
+
+            labels = [-100] * len(input_ids)
+            m = len(input_ids) - max_length
+            first_response    = response_ids[0]
+            first_instruction = instruction_ids[0]
+            j = 0
+            while j < m:
+                if input_ids[j] == first_response:
+                    if input_ids[j : j+response_length] == response_ids:
+                        j = j + response_length
+                        start = j
+                        while j < m:
+                            if input_ids[j] == first_instruction and input_ids[j : j+instruction_length] == instruction_ids:
+                                j = j + instruction_length
+                                labels[start : j] = input_ids[start : j]
+                                break
+                            elif j == (m-1):
+                                j = m
+                                labels[start:] = input_ids[start:]
+                                break
+                            pass
+                            j += 1
+                        pass
+                    pass
+                pass
+                j += 1
+            pass
+            all_labels.append(labels)
+        pass
+        return { "labels" : all_labels }
+    pass
+    trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True)
+    return trainer
 pass
 
 
